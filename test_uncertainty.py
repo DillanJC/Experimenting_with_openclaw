@@ -1,0 +1,184 @@
+"""
+Smoke tests for the kosmos uncertainty module.
+
+Run with:  python -m mcp_server.test_uncertainty
+"""
+
+import numpy as np
+from .uncertainty import (
+    classify_confidence,
+    compute_boundary_ratio,
+    compute_confidence_score,
+    compute_embedding_pr,
+    compute_sequence_pr,
+    compute_token_entropies,
+    compute_token_margins,
+    find_uncertain_spans,
+    generate_explanation,
+)
+
+
+def _approx(a: float, b: float, tol: float = 0.15) -> bool:
+    return abs(a - b) < tol
+
+
+def test_token_margins():
+    # High confidence: dominant token far above alternatives
+    top_lp_high = [
+        {"the": -0.01, "a": -3.5, "an": -4.0},
+        {"cat": -0.05, "dog": -2.8, "rat": -3.1},
+    ]
+    margins = compute_token_margins(top_lp_high)
+    assert margins[0] > 2.0, f"Expected large margin, got {margins[0]}"
+    assert margins[1] > 2.0, f"Expected large margin, got {margins[1]}"
+
+    # Low confidence: top two tokens are close
+    top_lp_low = [
+        {"yes": -0.8, "no": -0.9, "maybe": -2.0},
+        {"agree": -1.0, "disagree": -1.1, "uncertain": -1.5},
+    ]
+    margins_low = compute_token_margins(top_lp_low)
+    assert margins_low[0] < 0.5, f"Expected small margin, got {margins_low[0]}"
+    print("  token_margins: PASS")
+
+
+def test_token_entropies():
+    # Peaked distribution → low entropy
+    top_lp_peaked = [{"a": -0.01, "b": -5.0, "c": -6.0}]
+    ent = compute_token_entropies(top_lp_peaked)
+    assert ent[0] < 0.3, f"Expected low entropy, got {ent[0]}"
+
+    # Flat distribution → higher entropy
+    top_lp_flat = [{"a": -1.1, "b": -1.1, "c": -1.1}]
+    ent_flat = compute_token_entropies(top_lp_flat)
+    assert ent_flat[0] > 0.9, f"Expected high entropy, got {ent_flat[0]}"
+    print("  token_entropies: PASS")
+
+
+def test_sequence_pr():
+    # Dominated by one alternative → low PR
+    top_lp_dom = [
+        {"a": -0.01, "b": -8.0, "c": -9.0},
+        {"x": -0.02, "y": -7.0, "z": -8.0},
+        {"m": -0.01, "n": -6.0, "o": -7.0},
+    ]
+    pr_dom = compute_sequence_pr(top_lp_dom)
+
+    # Spread across alternatives → higher PR
+    top_lp_spread = [
+        {"a": -1.0, "b": -1.1, "c": -1.2},
+        {"x": -1.5, "y": -0.5, "z": -1.3},
+        {"m": -0.8, "n": -1.0, "o": -0.9},
+    ]
+    pr_spread = compute_sequence_pr(top_lp_spread)
+    assert pr_spread >= pr_dom, f"Spread PR ({pr_spread}) should be >= dominated PR ({pr_dom})"
+    print("  sequence_pr: PASS")
+
+
+def test_boundary_ratio():
+    margins = np.array([0.1, 0.2, 2.0, 3.0, 0.4])
+    br = compute_boundary_ratio(margins, threshold=0.5)
+    assert _approx(br, 0.6), f"Expected ~0.6, got {br}"
+    print("  boundary_ratio: PASS")
+
+
+def test_confidence_score():
+    # High confidence scenario
+    margins_high = np.array([3.0, 2.5, 4.0])
+    ent_high = np.array([0.1, 0.05, 0.08])
+    score_high = compute_confidence_score(margins_high, ent_high, 0.0)
+    assert score_high > 0.7, f"Expected high score, got {score_high}"
+    assert classify_confidence(score_high) in ("high", "moderate")
+
+    # Low confidence scenario
+    margins_low = np.array([0.1, 0.05, 0.2])
+    ent_low = np.array([2.0, 1.8, 2.2])
+    score_low = compute_confidence_score(margins_low, ent_low, 0.9)
+    assert score_low < 0.4, f"Expected low score, got {score_low}"
+    assert classify_confidence(score_low) in ("low", "very_low")
+    print("  confidence_score: PASS")
+
+
+def test_embedding_pr():
+    rng = np.random.default_rng(42)
+
+    # Clustered embeddings: low effective dim
+    cluster = rng.normal(0, 0.01, size=(30, 10))
+    cluster[:, 0] = rng.normal(0, 5, size=30)  # one dominant direction
+    res_cluster = compute_embedding_pr(cluster, k=10)
+    assert res_cluster["pr_mean"] >= 1.0
+
+    # Spread embeddings: higher effective dim
+    spread = rng.normal(0, 1, size=(30, 10))
+    res_spread = compute_embedding_pr(spread, k=10)
+    assert res_spread["effective_dim"] > res_cluster["effective_dim"], (
+        f"Spread eff_dim ({res_spread['effective_dim']}) should > "
+        f"clustered ({res_cluster['effective_dim']})"
+    )
+    print("  embedding_pr: PASS")
+
+
+def test_uncertain_spans():
+    tokens = ["The", " cat", " sat", " on", " the", " mat"]
+    margins = np.array([3.0, 0.2, 0.3, 2.5, 3.0, 0.1])
+    spans = find_uncertain_spans(tokens, margins, threshold=0.5)
+    assert len(spans) == 2, f"Expected 2 spans, got {len(spans)}"
+    assert spans[0]["start"] == 1
+    assert spans[0]["end"] == 3
+    assert spans[1]["start"] == 5
+    print("  uncertain_spans: PASS")
+
+
+def test_generate_explanation():
+    metrics = {
+        "confidence_score": 0.35,
+        "confidence_label": "low",
+        "boundary_ratio": 0.45,
+        "sequence_pr": 4.2,
+        "uncertain_span_count": 3,
+    }
+    explanation = generate_explanation(metrics)
+    assert "low" in explanation
+    assert "45%" in explanation
+    assert "3" in explanation
+    print("  generate_explanation: PASS")
+
+
+def test_confidence_report_integration():
+    """End-to-end test of the confidence_report tool logic."""
+    from .uncertainty import compute_token_margins as _m  # just to verify imports work
+
+    tokens = ["I", " think", " the", " answer", " is", " 42"]
+    logprobs = [-0.1, -0.5, -0.02, -1.2, -0.05, -0.8]
+    top_logprobs = [
+        {"I": -0.1, "We": -2.5, "You": -3.0},
+        {" think": -0.5, " believe": -0.6, " know": -1.5},
+        {" the": -0.02, " a": -4.0, " an": -5.0},
+        {" answer": -1.2, " result": -1.3, " number": -1.5},
+        {" is": -0.05, " was": -3.0, " will": -4.0},
+        {" 42": -0.8, " 43": -0.9, " 41": -1.0},
+    ]
+
+    margins = compute_token_margins(top_logprobs)
+    entropies = compute_token_entropies(top_logprobs)
+    br = compute_boundary_ratio(margins)
+    score = compute_confidence_score(margins, entropies, br)
+    label = classify_confidence(score)
+
+    assert 0.0 <= score <= 1.0
+    assert label in ("high", "moderate", "low", "very_low")
+    print("  confidence_report integration: PASS")
+
+
+if __name__ == "__main__":
+    print("Running kosmos uncertainty smoke tests...\n")
+    test_token_margins()
+    test_token_entropies()
+    test_sequence_pr()
+    test_boundary_ratio()
+    test_confidence_score()
+    test_embedding_pr()
+    test_uncertain_spans()
+    test_generate_explanation()
+    test_confidence_report_integration()
+    print("\nAll tests passed.")
