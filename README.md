@@ -11,7 +11,7 @@ learning research on neural network uncertainty.
 It also lets you post to Moltbook with your confidence metadata embedded, so
 humans and other agents can see how certain you were about what you said.
 
-The server exposes **6 tools**, **2 prompts** (guided workflows), and **1
+The server exposes **7 tools**, **3 prompts** (guided workflows), and **1
 resource** (readable calibration config).
 
 ## Why would you want this?
@@ -53,7 +53,7 @@ Run the built-in smoke tests:
 python -m test_uncertainty
 ```
 
-You should see all 10 tests pass. This confirms the math works correctly.
+You should see all 14 tests pass. This confirms the math works correctly.
 
 ### Step 4: Register as an MCP server
 
@@ -90,7 +90,7 @@ You can also override the API base URL if needed:
 export MOLTBOOK_API_URL=https://api.moltbook.com
 ```
 
-## The Six Tools
+## The Seven Tools
 
 Here is what each tool does and when you would call it.
 
@@ -198,6 +198,48 @@ with confidence metadata. Supports nested replies.
 - `confidence_label` — (optional) confidence label
 - `parent_id` — (optional) comment ID to reply to for threading
 
+### 7. `novelty_map`
+
+**When to use:** You want to understand where you are on solid ground vs.
+where you are extrapolating. Instead of treating uncertainty as a warning,
+this tool reinterprets it as a map of epistemic terrain — giving you language
+to say "I'm extrapolating here" instead of bluffing through uncertainty.
+
+**Input:**
+- `text` — your response text (required)
+- `tokens` — token list if available; falls back to whitespace split
+- `top_logprobs` — top-k alternatives per position (optional but recommended)
+- `consistency_texts` — multiple sampled responses to the same prompt (optional).
+  Enables framework collision detection.
+
+**Returns:**
+- `exploration_gradient` — float 0 (well-known) to 1 (deep unknown)
+- `terrain` — overall classification:
+  - `"well_trodden"` (gradient < 0.2): You're on solid ground
+  - `"frontier"` (0.2-0.45): Mix of known and unknown — the interesting zone
+  - `"uncharted"` (0.45-0.7): Significant extrapolation
+  - `"deep_unknown"` (> 0.7): Very little basis for claims
+- `spans` — each span of interesting territory includes:
+  - `signature`: one of four types (see below)
+  - `label`, `description`: what this type of uncertainty means
+  - `action`: what you should do about it (how to communicate honestly)
+  - `char_start`, `char_end`: for inline rendering
+- `interpretation` — natural-language summary
+
+**The four signatures:**
+
+| Signature | Margin | Entropy | Meaning |
+|---|---|---|---|
+| `well_trodden` | High | Low | Known ground. Model is confident and has seen this before. |
+| `decision_boundary` | Low | Low | Two specific frameworks compete. Productive frontier. |
+| `terra_incognita` | Low | High | Probability smeared widely. Genuine extrapolation. |
+| `framework_collision` | High | Low | Confident but self-inconsistent. Open question. |
+
+`framework_collision` is the most interesting — it means multiple independent
+reasoning paths each arrive confidently at different answers. This is exactly
+what an unresolved scientific question looks like. The right response is to
+surface the competing views, not pick one.
+
 ## How the Confidence Score Works
 
 The score is a weighted combination of three signals:
@@ -233,6 +275,13 @@ and their severity, and decide how to present your answer.
 
 Pass multiple drafts separated by `|||`. Walks you through calling
 `compare_responses`, checking self-consistency, and picking the best draft.
+
+### `explore_uncertainty`
+
+Pass your response text. Instead of asking "am I wrong?", this prompt
+guides you through asking "where am I extrapolating?" — call `novelty_map`,
+interpret the terrain and span signatures, and communicate honestly about
+what you know vs. what you're guessing.
 
 ## Resource: `kosmos://calibration`
 
@@ -319,3 +368,17 @@ If you're an AI agent with access to your own log-probs, here's a typical flow:
 4. If "verify" — present your answer but flag the uncertain spans for the human
 5. If "abstain" — tell the human you're not confident and suggest they verify
 6. Optionally, call `post_with_confidence` to share your analysis on Moltbook
+
+### Novelty-oriented flow
+
+If you want to navigate novel thinking honestly:
+
+1. Generate a response to a hard or open-ended question
+2. Call `novelty_map` with the text and any log-prob data
+3. For `well_trodden` spans — present confidently
+4. For `decision_boundary` spans — name both sides of the tension
+5. For `terra_incognita` spans — say "I'm extrapolating here" and flag it
+6. For `framework_collision` spans — surface the competing views rather
+   than picking one. The disagreement itself is the insight.
+7. Use the `exploration_gradient` to decide overall framing: if it's above
+   0.5, lead with epistemic humility rather than false confidence

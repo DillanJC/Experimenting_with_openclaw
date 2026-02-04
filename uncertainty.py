@@ -427,3 +427,316 @@ def generate_explanation(metrics: dict) -> str:
         parts.append("Insufficient data for a detailed explanation.")
 
     return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Novelty map — reinterprets uncertainty as exploration gradient
+# ---------------------------------------------------------------------------
+
+# The four epistemic signatures:
+#
+#   well_trodden       — high margin, low entropy.  Model is sure. Known ground.
+#   decision_boundary  — low margin, low entropy.   Two competing frameworks.
+#                        The question is well-formed enough to have rivals.
+#   terra_incognita    — low margin, high entropy.   Probability smeared across
+#                        many options. The model is extrapolating.
+#   framework_collision — high confidence per-sample but low self-consistency.
+#                        Multiple coherent reasoning paths reach different
+#                        conclusions. The hallmark of an open question.
+
+_NOVELTY_SIGNATURES = {
+    "well_trodden": {
+        "label": "Well-trodden",
+        "description": "Established pattern with clear consensus.",
+        "action": "Proceed — this is known ground.",
+    },
+    "decision_boundary": {
+        "label": "Decision boundary",
+        "description": (
+            "The model is torn between a small number of specific alternatives. "
+            "This is where two established frameworks collide — a productive "
+            "frontier where the question is well-formed enough to have rivals."
+        ),
+        "action": "Explore both sides. The tension itself is informative.",
+    },
+    "terra_incognita": {
+        "label": "Terra incognita",
+        "description": (
+            "Probability is smeared across many alternatives. The model is "
+            "extrapolating beyond its training distribution. This could be "
+            "noise, or it could be genuinely novel territory."
+        ),
+        "action": (
+            "I'm extrapolating here. Treat this as a hypothesis, not a fact. "
+            "Consider reframing the question or seeking external sources."
+        ),
+    },
+    "framework_collision": {
+        "label": "Framework collision",
+        "description": (
+            "Multiple independent reasoning paths each arrive confidently at "
+            "different conclusions. This is the signature of an unresolved "
+            "question where coherent but incompatible frameworks coexist."
+        ),
+        "action": (
+            "This is genuinely contested. Surface the competing frameworks "
+            "rather than picking one. The disagreement is the insight."
+        ),
+    },
+}
+
+
+def classify_novelty_signature(
+    margin: float,
+    entropy: float,
+    consistency: float | None = None,
+    margin_threshold: float = 0.5,
+    entropy_threshold: float = 1.0,
+    consistency_threshold: float = 0.3,
+) -> str:
+    """Classify a single position or span into one of four novelty signatures.
+
+    Args:
+        margin: Token margin (top1 - top2 log-prob). Low = uncertain.
+        entropy: Shannon entropy of top-k distribution. High = spread.
+        consistency: Self-consistency score (0-1). Low = disagreement.
+            Only used if provided (requires multiple samples).
+        margin_threshold: Below this margin = uncertain.
+        entropy_threshold: Above this entropy = spread.
+        consistency_threshold: Below this agreement = collision.
+
+    Returns:
+        One of: "well_trodden", "decision_boundary", "terra_incognita",
+        "framework_collision".
+    """
+    low_margin = margin < margin_threshold
+    high_entropy = entropy > entropy_threshold
+
+    # Framework collision takes priority — it requires consistency data
+    if consistency is not None and consistency < consistency_threshold:
+        if not low_margin:
+            # Confident but disagreeing — the most interesting signal
+            return "framework_collision"
+
+    if not low_margin and not high_entropy:
+        return "well_trodden"
+    if low_margin and not high_entropy:
+        return "decision_boundary"
+    # low margin + high entropy, or high margin + high entropy
+    return "terra_incognita"
+
+
+def compute_exploration_gradient(
+    margins: np.ndarray,
+    entropies: np.ndarray,
+) -> float:
+    """Overall exploration gradient from 0 (well-trodden) to 1 (uncharted).
+
+    Combines margin and entropy signals into a single scalar.
+    High gradient = the model is operating far from its training distribution.
+    """
+    finite = margins[np.isfinite(margins)]
+    if len(finite) == 0:
+        return 0.0
+
+    # Margin component: low margin → high gradient
+    mean_margin = float(np.mean(finite))
+    margin_gradient = max(1.0 - mean_margin / 2.0, 0.0)
+
+    # Entropy component: high entropy → high gradient
+    mean_entropy = float(np.mean(entropies))
+    entropy_gradient = min(mean_entropy / 2.0, 1.0)
+
+    # Boundary density: what fraction of tokens are uncertain
+    boundary_frac = float(np.mean(finite < 0.5))
+
+    # Weighted combination
+    gradient = 0.35 * margin_gradient + 0.35 * entropy_gradient + 0.3 * boundary_frac
+    return round(float(np.clip(gradient, 0.0, 1.0)), 4)
+
+
+def build_novelty_map(
+    tokens: list[str],
+    margins: np.ndarray,
+    entropies: np.ndarray,
+    consistency: float | None = None,
+) -> dict:
+    """Build a full novelty map from token-level signals.
+
+    Returns a dict with:
+      - exploration_gradient: 0 (known) to 1 (uncharted)
+      - terrain_label: overall terrain classification
+      - spans: list of novelty-classified spans (like uncertain_spans but
+        with signature, description, and recommended action)
+      - signature_counts: how many spans of each type
+      - interpretation: natural-language summary
+    """
+    gradient = compute_exploration_gradient(margins, entropies)
+
+    # Classify each token
+    per_token_sigs: list[str] = []
+    for i in range(len(tokens)):
+        m = float(margins[i]) if np.isfinite(margins[i]) else 5.0
+        e = float(entropies[i]) if i < len(entropies) else 0.0
+        sig = classify_novelty_signature(m, e, consistency)
+        per_token_sigs.append(sig)
+
+    # Build contiguous spans of non-well-trodden territory
+    char_offsets: list[int] = []
+    pos = 0
+    for tok in tokens:
+        char_offsets.append(pos)
+        pos += len(tok)
+
+    spans: list[dict] = []
+    in_span = False
+    start = 0
+    span_tokens: list[str] = []
+    span_sig = "well_trodden"
+    span_min_margin = float("inf")
+    span_max_entropy = 0.0
+
+    for i, (tok, sig) in enumerate(zip(tokens, per_token_sigs)):
+        interesting = sig != "well_trodden"
+        if interesting:
+            if not in_span:
+                start = i
+                span_tokens = []
+                span_sig = sig
+                span_min_margin = float("inf")
+                span_max_entropy = 0.0
+                in_span = True
+            span_tokens.append(tok)
+            m = float(margins[i]) if np.isfinite(margins[i]) else 5.0
+            e = float(entropies[i]) if i < len(entropies) else 0.0
+            span_min_margin = min(span_min_margin, m)
+            span_max_entropy = max(span_max_entropy, e)
+            # Upgrade span signature to the most novel type seen
+            if _sig_rank(sig) > _sig_rank(span_sig):
+                span_sig = sig
+        else:
+            if in_span:
+                text = "".join(span_tokens)
+                info = _NOVELTY_SIGNATURES[span_sig]
+                spans.append({
+                    "start": start,
+                    "end": i,
+                    "char_start": char_offsets[start],
+                    "char_end": char_offsets[start] + len(text),
+                    "text": text,
+                    "signature": span_sig,
+                    "label": info["label"],
+                    "description": info["description"],
+                    "action": info["action"],
+                    "min_margin": round(span_min_margin, 4),
+                    "max_entropy": round(span_max_entropy, 4),
+                })
+                in_span = False
+
+    if in_span:
+        text = "".join(span_tokens)
+        info = _NOVELTY_SIGNATURES[span_sig]
+        spans.append({
+            "start": start,
+            "end": len(tokens),
+            "char_start": char_offsets[start],
+            "char_end": char_offsets[start] + len(text),
+            "text": text,
+            "signature": span_sig,
+            "label": info["label"],
+            "description": info["description"],
+            "action": info["action"],
+            "min_margin": round(span_min_margin, 4),
+            "max_entropy": round(span_max_entropy, 4),
+        })
+
+    # Signature counts
+    sig_counts: dict[str, int] = {}
+    for s in per_token_sigs:
+        sig_counts[s] = sig_counts.get(s, 0) + 1
+
+    # Overall terrain
+    if gradient < 0.2:
+        terrain = "well_trodden"
+    elif gradient < 0.45:
+        terrain = "frontier"
+    elif gradient < 0.7:
+        terrain = "uncharted"
+    else:
+        terrain = "deep_unknown"
+
+    interpretation = _novelty_interpretation(
+        gradient, terrain, spans, sig_counts, consistency
+    )
+
+    return {
+        "exploration_gradient": gradient,
+        "terrain": terrain,
+        "spans": spans,
+        "signature_counts": sig_counts,
+        "interpretation": interpretation,
+    }
+
+
+def _sig_rank(sig: str) -> int:
+    """Rank signatures by novelty level for span upgrading."""
+    return {
+        "well_trodden": 0,
+        "decision_boundary": 1,
+        "terra_incognita": 2,
+        "framework_collision": 3,
+    }.get(sig, 0)
+
+
+def _novelty_interpretation(
+    gradient: float,
+    terrain: str,
+    spans: list[dict],
+    sig_counts: dict[str, int],
+    consistency: float | None,
+) -> str:
+    """Generate natural-language interpretation of the novelty map."""
+    parts: list[str] = []
+
+    terrain_labels = {
+        "well_trodden": "This is well-trodden ground.",
+        "frontier": "This is frontier territory — some established ground, some open questions.",
+        "uncharted": "This is largely uncharted territory. The model is extrapolating significantly.",
+        "deep_unknown": "This is deep unknown. The model has very little basis for its claims here.",
+    }
+    parts.append(terrain_labels.get(terrain, ""))
+
+    n_boundary = sig_counts.get("decision_boundary", 0)
+    n_terra = sig_counts.get("terra_incognita", 0)
+    n_collision = sig_counts.get("framework_collision", 0)
+
+    if n_boundary > 0:
+        parts.append(
+            f"{n_boundary} token(s) sit at decision boundaries where "
+            f"competing frameworks meet."
+        )
+    if n_terra > 0:
+        parts.append(
+            f"{n_terra} token(s) are in terra incognita — the model is "
+            f"genuinely unsure and spreading probability widely."
+        )
+    if n_collision > 0:
+        parts.append(
+            f"{n_collision} token(s) show framework collision — confident "
+            f"but inconsistent across reasoning paths."
+        )
+
+    if consistency is not None and consistency < 0.3:
+        parts.append(
+            "Multiple reasoning paths reach different conclusions. "
+            "The disagreement itself is informative — surface the "
+            "competing views rather than choosing one."
+        )
+
+    if not spans:
+        parts.append(
+            "No regions of particular novelty detected. "
+            "The model is operating within its training distribution."
+        )
+
+    return " ".join(parts)

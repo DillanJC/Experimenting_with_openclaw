@@ -6,10 +6,13 @@ Run with:  python -m mcp_server.test_uncertainty
 
 import numpy as np
 from .uncertainty import (
+    build_novelty_map,
     classify_confidence,
+    classify_novelty_signature,
     compute_boundary_ratio,
     compute_confidence_score,
     compute_embedding_pr,
+    compute_exploration_gradient,
     compute_self_consistency,
     compute_sequence_pr,
     compute_token_entropies,
@@ -211,6 +214,107 @@ def test_confidence_report_integration():
     print("  confidence_report integration: PASS")
 
 
+def test_novelty_signatures():
+    # Well-trodden: high margin, low entropy
+    assert classify_novelty_signature(2.0, 0.3) == "well_trodden"
+
+    # Decision boundary: low margin, low entropy
+    assert classify_novelty_signature(0.1, 0.3) == "decision_boundary"
+
+    # Terra incognita: low margin, high entropy
+    assert classify_novelty_signature(0.1, 1.5) == "terra_incognita"
+
+    # Framework collision: decent margin but low consistency
+    assert classify_novelty_signature(
+        0.8, 0.3, consistency=0.15
+    ) == "framework_collision"
+
+    # With consistency but still agreeing — should be well_trodden
+    assert classify_novelty_signature(
+        2.0, 0.3, consistency=0.8
+    ) == "well_trodden"
+
+    print("  novelty_signatures: PASS")
+
+
+def test_exploration_gradient():
+    # Confident tokens → low gradient
+    margins_sure = np.array([3.0, 2.5, 4.0])
+    entropies_low = np.array([0.1, 0.05, 0.08])
+    grad_low = compute_exploration_gradient(margins_sure, entropies_low)
+    assert grad_low < 0.3, f"Expected low gradient, got {grad_low}"
+
+    # Uncertain tokens → high gradient
+    margins_unsure = np.array([0.1, 0.05, 0.2])
+    entropies_high = np.array([2.0, 1.8, 2.2])
+    grad_high = compute_exploration_gradient(margins_unsure, entropies_high)
+    assert grad_high > 0.6, f"Expected high gradient, got {grad_high}"
+
+    assert grad_high > grad_low
+    print("  exploration_gradient: PASS")
+
+
+def test_novelty_map_integration():
+    # Mix of confident and uncertain tokens
+    tokens = ["The", " capital", " of", " France", " is", " arguably", " Paris"]
+    top_logprobs = [
+        {"The": -0.01, "A": -4.0},
+        {" capital": -0.05, " city": -3.0},
+        {" of": -0.01, " in": -5.0},
+        {" France": -0.02, " Germany": -3.5},
+        {" is": -0.01, " was": -4.0},
+        # "arguably" — the model was unsure here
+        {" arguably": -0.9, " definitely": -1.0, " probably": -1.1, " perhaps": -1.2},
+        {" Paris": -0.3, " Lyon": -0.5, " Marseille": -1.0},
+    ]
+
+    margins = compute_token_margins(top_logprobs)
+    entropies = compute_token_entropies(top_logprobs)
+
+    result = build_novelty_map(tokens, margins, entropies)
+
+    assert "exploration_gradient" in result
+    assert 0.0 <= result["exploration_gradient"] <= 1.0
+    assert result["terrain"] in ("well_trodden", "frontier", "uncharted", "deep_unknown")
+    assert "spans" in result
+    assert "interpretation" in result
+
+    # The uncertain tokens should produce at least one non-well-trodden span
+    if result["spans"]:
+        span = result["spans"][0]
+        assert span["signature"] in (
+            "decision_boundary", "terra_incognita", "framework_collision"
+        )
+        assert "action" in span
+        assert "description" in span
+        assert "char_start" in span
+
+    print("  novelty_map integration: PASS")
+
+
+def test_novelty_map_with_consistency():
+    """Framework collision detection via consistency_texts."""
+    tokens = ["Yes", ",", " definitely"]
+    margins = np.array([1.5, 3.0, 1.2])  # individually confident
+    entropies = np.array([0.3, 0.01, 0.4])
+
+    # Low consistency → should produce framework_collision spans
+    result_collision = build_novelty_map(
+        tokens, margins, entropies, consistency=0.15
+    )
+    has_collision = "framework_collision" in result_collision.get("signature_counts", {})
+    # With low consistency and decent margins, at least some tokens should collide
+    assert has_collision, f"Expected framework_collision, got {result_collision['signature_counts']}"
+
+    # High consistency → should be well_trodden
+    result_ok = build_novelty_map(
+        tokens, margins, entropies, consistency=0.9
+    )
+    assert result_ok.get("signature_counts", {}).get("well_trodden", 0) > 0
+
+    print("  novelty_map with consistency: PASS")
+
+
 if __name__ == "__main__":
     print("Running kosmos uncertainty smoke tests...\n")
     test_token_margins()
@@ -223,4 +327,8 @@ if __name__ == "__main__":
     test_self_consistency()
     test_generate_explanation()
     test_confidence_report_integration()
+    test_novelty_signatures()
+    test_exploration_gradient()
+    test_novelty_map_integration()
+    test_novelty_map_with_consistency()
     print("\nAll tests passed.")

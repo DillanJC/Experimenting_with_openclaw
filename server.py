@@ -10,10 +10,12 @@ Tools:
   4. compare_responses      – compare uncertainty across candidate responses
   5. post_with_confidence   – post to Moltbook with confidence metadata
   6. comment_with_confidence – comment on a Moltbook post
+  7. novelty_map            – reinterpret uncertainty as exploration terrain
 
 Prompts:
   - assess-my-response  – guided workflow for single-response assessment
   - compare-drafts      – guided workflow for multi-response comparison
+  - explore-uncertainty  – guided workflow for novelty-oriented thinking
 
 Resources:
   - kosmos://calibration – current scoring weights and confidence thresholds
@@ -27,10 +29,12 @@ import time
 from mcp.server.fastmcp import FastMCP
 
 from .uncertainty import (
+    build_novelty_map,
     classify_confidence,
     compute_boundary_ratio,
     compute_confidence_score,
     compute_embedding_pr,
+    compute_exploration_gradient,
     compute_self_consistency,
     compute_sequence_pr,
     compute_token_entropies,
@@ -154,6 +158,38 @@ def compare_drafts(draft_texts: str) -> str:
         f"3. Check `best_index` to see which draft scored highest.\n"
         f"4. If `score_spread` is large, explain why one draft is better.\n"
         f"5. If all drafts agree and are confident, proceed with the best one."
+    )
+
+
+@mcp.prompt()
+def explore_uncertainty(response_text: str) -> str:
+    """Guided workflow for novelty-oriented thinking.
+
+    Use this when you want to understand *where* you are extrapolating
+    and treat uncertainty as a map of interesting territory rather than
+    a warning to retreat.
+    """
+    return (
+        f"I want to map the epistemic terrain of my response:\n\n"
+        f"---\n{response_text}\n---\n\n"
+        f"Steps:\n"
+        f"1. Call `novelty_map` with the text above and any log-prob data.\n"
+        f"2. Check the `terrain` field:\n"
+        f"   - \"well_trodden\": I'm on solid ground. Nothing novel here.\n"
+        f"   - \"frontier\": Mix of known and unknown. The interesting zone.\n"
+        f"   - \"uncharted\": I'm extrapolating significantly.\n"
+        f"   - \"deep_unknown\": I have very little basis for these claims.\n"
+        f"3. Look at each span's `signature`:\n"
+        f"   - \"decision_boundary\": Two frameworks compete here. "
+        f"Explore both sides.\n"
+        f"   - \"terra_incognita\": I'm genuinely guessing. Say so honestly.\n"
+        f"   - \"framework_collision\": Multiple coherent but incompatible "
+        f"views. Surface the disagreement — don't hide it.\n"
+        f"4. Use each span's `action` field to decide how to communicate:\n"
+        f"   present known ground confidently, flag frontiers as open "
+        f"questions, and be transparent about extrapolation.\n"
+        f"5. The `exploration_gradient` (0-1) tells you overall how far "
+        f"from training distribution you are."
     )
 
 
@@ -466,6 +502,67 @@ def comment_with_confidence(
         confidence_label=confidence_label,
         parent_id=parent_id,
     )
+
+
+# ── Tool 7 ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def novelty_map(
+    text: str,
+    tokens: list[str] | None = None,
+    top_logprobs: list[dict] | None = None,
+    consistency_texts: list[str] | None = None,
+) -> dict:
+    """Map the epistemic terrain of a response — where are you on solid
+    ground, where are you at a frontier, and where are you extrapolating?
+
+    Instead of treating uncertainty as a warning, this tool reinterprets
+    it as a map of interesting territory. Use it when you want to be
+    honest about what you know vs. what you're guessing.
+
+    Args:
+        text: The response text to analyze.
+        tokens: Token list (if available). Falls back to whitespace split.
+        top_logprobs: Top-k log-prob dicts per position (optional but
+            recommended — without these, classification is coarse).
+        consistency_texts: Multiple sampled responses to the same prompt
+            (optional). If provided, enables framework collision detection
+            via self-consistency analysis.
+
+    Returns:
+        Dict with exploration_gradient (0=known, 1=uncharted), terrain
+        label, novelty-classified spans with descriptions and recommended
+        actions, and a natural-language interpretation.
+    """
+    _log_tool("novelty_map", text_len=len(text),
+              has_top_logprobs=top_logprobs is not None,
+              has_consistency=consistency_texts is not None)
+
+    tok = tokens if tokens is not None else text.split()
+
+    # Compute signals from whatever data is available
+    if top_logprobs is not None and len(top_logprobs) == len(tok):
+        margins = compute_token_margins(top_logprobs)
+        entropies = compute_token_entropies(top_logprobs)
+    else:
+        # No log-probs — use neutral values. The map will be coarse
+        # but still useful if consistency_texts are provided.
+        margins = np.full(len(tok), 1.0)   # neutral margin
+        entropies = np.zeros(len(tok))      # neutral entropy
+
+    # Self-consistency for framework collision detection
+    consistency = None
+    consistency_detail = None
+    if consistency_texts is not None and len(consistency_texts) >= 2:
+        consistency_detail = compute_self_consistency(consistency_texts)
+        consistency = consistency_detail.get("agreement")
+
+    result = build_novelty_map(tok, margins, entropies, consistency)
+
+    if consistency_detail is not None:
+        result["self_consistency"] = consistency_detail
+
+    return result
 
 
 # ── Entry point ───────────────────────────────────────────────────────────
