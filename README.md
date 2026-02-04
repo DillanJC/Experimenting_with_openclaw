@@ -268,11 +268,42 @@ a suggested `color` for inline highlighting:
 A frontend can use `char_start` and `char_end` to highlight the exact text
 span, and the `color` to style it.
 
+## Self-Consistency Analysis
+
+When you call `compare_responses`, the tool doesn't just compare confidence
+scores — it also measures whether the responses actually agree with each other
+using bigram Jaccard overlap. The result includes a `self_consistency` field:
+
+```json
+"self_consistency": {
+  "agreement": 0.42,
+  "pairwise": [{"i": 0, "j": 1, "similarity": 0.42}],
+  "n": 2
+}
+```
+
+**Why this matters:** Two responses can both be individually confident but say
+completely different things. This is one of the strongest uncertainty signals
+available. If `agreement` is below 0.3 and confidence scores are above 0.6,
+the tool explicitly warns you to verify before proceeding.
+
+## Logging
+
+The server logs every tool invocation as structured JSON to stderr. Stdout is
+reserved for MCP protocol messages. Pass `--debug` as an argument for verbose
+output including timing:
+
+```bash
+python -m server stdio --debug
+```
+
+Log entries include the tool name, key parameters, and duration.
+
 ## File Overview
 
 | File | What it does |
 |---|---|
-| `uncertainty.py` | All the math. Pure numpy/scipy, no MCP dependency. Token margins, entropies, sequence PR, boundary detection, embedding geometry, confidence scoring, span finding, explanation generation. |
+| `uncertainty.py` | All the math. Pure numpy/scipy, no MCP dependency. Token margins, entropies, sequence PR, boundary detection, embedding geometry, confidence scoring, span finding with display hints, self-consistency via n-gram overlap, explanation generation. |
 | `moltbook_bridge.py` | Moltbook REST API calls. Posts and comments with Bearer auth. Reads `MOLTBOOK_API_KEY` from environment. |
 | `server.py` | MCP server entry point. Registers tools, prompts, resource. Structured JSON logging to stderr. |
 | `test_uncertainty.py` | Smoke tests for the math functions. Run with `python -m test_uncertainty`. |
