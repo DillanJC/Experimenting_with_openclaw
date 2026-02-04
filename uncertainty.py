@@ -282,8 +282,17 @@ def find_uncertain_spans(
 ) -> list[dict]:
     """Identify contiguous spans of low-margin tokens.
 
-    Returns a list of dicts with keys: start, end, tokens, min_margin.
+    Returns a list of dicts with keys: start, end (token indices),
+    char_start, char_end (character offsets into the joined token string),
+    tokens, text, and min_margin.
     """
+    # Pre-compute character offset of each token in the joined string
+    char_offsets: list[int] = []
+    pos = 0
+    for tok in tokens:
+        char_offsets.append(pos)
+        pos += len(tok)
+
     spans: list[dict] = []
     in_span = False
     start = 0
@@ -302,21 +311,27 @@ def find_uncertain_spans(
             span_min = min(span_min, float(m))
         else:
             if in_span:
+                text = "".join(span_tokens)
                 spans.append({
                     "start": start,
                     "end": i,
+                    "char_start": char_offsets[start],
+                    "char_end": char_offsets[start] + len(text),
                     "tokens": span_tokens,
-                    "text": "".join(span_tokens),
+                    "text": text,
                     "min_margin": round(span_min, 4),
                 })
                 in_span = False
     # Close trailing span
     if in_span:
+        text = "".join(span_tokens)
         spans.append({
             "start": start,
             "end": len(tokens),
+            "char_start": char_offsets[start],
+            "char_end": char_offsets[start] + len(text),
             "tokens": span_tokens,
-            "text": "".join(span_tokens),
+            "text": text,
             "min_margin": round(span_min, 4),
         })
     return spans

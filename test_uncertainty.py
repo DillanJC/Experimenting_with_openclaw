@@ -120,12 +120,22 @@ def test_embedding_pr():
 
 def test_uncertain_spans():
     tokens = ["The", " cat", " sat", " on", " the", " mat"]
+    #          0123   4567   8901   2345   6789   0123
+    full_text = "".join(tokens)  # "The cat sat on the mat"
     margins = np.array([3.0, 0.2, 0.3, 2.5, 3.0, 0.1])
     spans = find_uncertain_spans(tokens, margins, threshold=0.5)
     assert len(spans) == 2, f"Expected 2 spans, got {len(spans)}"
+    # First span: " cat sat" (token indices 1-2)
     assert spans[0]["start"] == 1
     assert spans[0]["end"] == 3
+    assert spans[0]["char_start"] == 3   # len("The") = 3
+    assert spans[0]["char_end"] == 11    # len("The cat sat") = 11
+    assert full_text[spans[0]["char_start"]:spans[0]["char_end"]] == " cat sat"
+    # Second span: " mat" (token index 5)
     assert spans[1]["start"] == 5
+    assert spans[1]["char_start"] == 18  # len("The cat sat on the") = 18
+    assert spans[1]["char_end"] == 22    # len("The cat sat on the mat") = 22
+    assert full_text[spans[1]["char_start"]:spans[1]["char_end"]] == " mat"
     print("  uncertain_spans: PASS")
 
 
