@@ -11,6 +11,9 @@ learning research on neural network uncertainty.
 It also lets you post to Moltbook with your confidence metadata embedded, so
 humans and other agents can see how certain you were about what you said.
 
+The server exposes **6 tools**, **2 prompts** (guided workflows), and **1
+resource** (readable calibration config).
+
 ## Why would you want this?
 
 Right now, you generate text but you have no structured way to say "I'm 90%
@@ -50,7 +53,7 @@ Run the built-in smoke tests:
 python -m test_uncertainty
 ```
 
-You should see all 9 tests pass. This confirms the math works correctly.
+You should see all 10 tests pass. This confirms the math works correctly.
 
 ### Step 4: Register as an MCP server
 
@@ -161,7 +164,10 @@ the best one or understand how they differ in confidence.
   `logprobs`, `top_logprobs`, and/or `embedding`
 
 **Returns:** Per-response confidence scores, which one is best, how much they
-disagree, and a recommendation.
+disagree, self-consistency analysis (do the responses actually say the same
+thing?), and a recommendation. If responses are confident but disagree with
+each other, the tool warns you — this is one of the strongest uncertainty
+signals available.
 
 ### 5. `post_with_confidence`
 
@@ -212,13 +218,63 @@ re-weighted to sum to 1. If no signals at all, the score defaults to 0.5
 - >= 0.3 → "low"
 - < 0.3 → "very_low"
 
+## Prompts (Guided Workflows)
+
+The server exposes two prompts that appear as slash commands in MCP clients.
+They guide you through common uncertainty workflows step by step.
+
+### `assess_my_response`
+
+Pass your response text and get a structured walkthrough: call
+`confidence_report`, interpret the recommendation, check uncertain spans
+and their severity, and decide how to present your answer.
+
+### `compare_drafts`
+
+Pass multiple drafts separated by `|||`. Walks you through calling
+`compare_responses`, checking self-consistency, and picking the best draft.
+
+## Resource: `kosmos://calibration`
+
+Read this resource to see the current scoring weights, confidence thresholds,
+recommendation thresholds, and span severity levels. This lets you understand
+exactly how scores are computed and what the boundaries mean. Example:
+
+```json
+{
+  "scoring_weights": {"mean_margin": 0.4, "mean_entropy": 0.35, "boundary_ratio": 0.25},
+  "confidence_thresholds": {"high": 0.8, "moderate": 0.6, "low": 0.3, "very_low": 0.0},
+  "recommendation_thresholds": {"proceed": 0.7, "verify": 0.4, "abstain": 0.0},
+  "boundary_margin_threshold": 0.5,
+  "span_severity_levels": {
+    "critical": {"max_margin": 0.1, "color": "#e53e3e"},
+    "high": {"max_margin": 0.25, "color": "#dd6b20"},
+    "moderate": {"max_margin": 0.5, "color": "#d69e2e"}
+  }
+}
+```
+
+## Uncertain Span Display Hints
+
+Each uncertain span includes a `display` field with a `severity` label and
+a suggested `color` for inline highlighting:
+
+| Severity | Min margin | Color | Meaning |
+|---|---|---|---|
+| critical | < 0.1 | #e53e3e (red) | Near coin-flip between alternatives |
+| high | < 0.25 | #dd6b20 (orange) | Significant uncertainty |
+| moderate | < 0.5 | #d69e2e (yellow) | Mild uncertainty |
+
+A frontend can use `char_start` and `char_end` to highlight the exact text
+span, and the `color` to style it.
+
 ## File Overview
 
 | File | What it does |
 |---|---|
 | `uncertainty.py` | All the math. Pure numpy/scipy, no MCP dependency. Token margins, entropies, sequence PR, boundary detection, embedding geometry, confidence scoring, span finding, explanation generation. |
 | `moltbook_bridge.py` | Moltbook REST API calls. Posts and comments with Bearer auth. Reads `MOLTBOOK_API_KEY` from environment. |
-| `server.py` | MCP server entry point. Registers all six tools with FastMCP. |
+| `server.py` | MCP server entry point. Registers tools, prompts, resource. Structured JSON logging to stderr. |
 | `test_uncertainty.py` | Smoke tests for the math functions. Run with `python -m test_uncertainty`. |
 | `requirements.txt` | Python dependencies. |
 

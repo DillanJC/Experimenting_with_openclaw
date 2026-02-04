@@ -1,14 +1,28 @@
 """
 Kosmos MCP Server — Uncertainty awareness for AI agents.
 
-Exposes six tools via the Model Context Protocol:
-  1. analyze_logprobs   – token-level uncertainty from log-probabilities
-  2. analyze_embeddings – geometric analysis of embedding vectors
-  3. confidence_report  – high-level confidence assessment
-  4. compare_responses  – compare uncertainty across candidate responses
-  5. post_with_confidence – post to Moltbook with confidence metadata
-  6. comment_with_confidence – comment on a Moltbook post with confidence metadata
+Exposes tools, prompts, and resources via the Model Context Protocol:
+
+Tools:
+  1. analyze_logprobs       – token-level uncertainty from log-probabilities
+  2. analyze_embeddings     – geometric analysis of embedding vectors
+  3. confidence_report      – high-level confidence assessment
+  4. compare_responses      – compare uncertainty across candidate responses
+  5. post_with_confidence   – post to Moltbook with confidence metadata
+  6. comment_with_confidence – comment on a Moltbook post
+
+Prompts:
+  - assess-my-response  – guided workflow for single-response assessment
+  - compare-drafts      – guided workflow for multi-response comparison
+
+Resources:
+  - kosmos://calibration – current scoring weights and confidence thresholds
 """
+
+import json
+import logging
+import sys
+import time
 
 from mcp.server.fastmcp import FastMCP
 
@@ -17,6 +31,7 @@ from .uncertainty import (
     compute_boundary_ratio,
     compute_confidence_score,
     compute_embedding_pr,
+    compute_self_consistency,
     compute_sequence_pr,
     compute_token_entropies,
     compute_token_margins,
@@ -27,7 +42,119 @@ from .moltbook_bridge import comment_on_moltbook, post_to_moltbook
 
 import numpy as np
 
+# ── Structured logging to stderr ──────────────────────────────────────────
+
+_log = logging.getLogger("kosmos")
+_log.setLevel(logging.DEBUG if "--debug" in sys.argv else logging.INFO)
+_handler = logging.StreamHandler(sys.stderr)
+_handler.setFormatter(logging.Formatter(
+    json.dumps({
+        "ts": "%(asctime)s",
+        "level": "%(levelname)s",
+        "logger": "%(name)s",
+        "msg": "%(message)s",
+    })
+))
+_log.addHandler(_handler)
+
+
+def _log_tool(name: str, **kwargs):
+    """Log a tool invocation with timing context."""
+    _log.info(f"tool={name} {' '.join(f'{k}={v}' for k, v in kwargs.items())}")
+
+
 mcp = FastMCP("kosmos", instructions="Uncertainty awareness for AI agents")
+
+
+# ── Calibration constants (exposed as resource) ──────────────────────────
+
+CALIBRATION = {
+    "scoring_weights": {
+        "mean_margin": 0.4,
+        "mean_entropy": 0.35,
+        "boundary_ratio": 0.25,
+    },
+    "confidence_thresholds": {
+        "high": 0.8,
+        "moderate": 0.6,
+        "low": 0.3,
+        "very_low": 0.0,
+    },
+    "recommendation_thresholds": {
+        "proceed": 0.7,
+        "verify": 0.4,
+        "abstain": 0.0,
+    },
+    "boundary_margin_threshold": 0.5,
+    "span_severity_levels": {
+        "critical": {"max_margin": 0.1, "color": "#e53e3e"},
+        "high": {"max_margin": 0.25, "color": "#dd6b20"},
+        "moderate": {"max_margin": 0.5, "color": "#d69e2e"},
+    },
+}
+
+
+# ── Resource ──────────────────────────────────────────────────────────────
+
+@mcp.resource("kosmos://calibration")
+def get_calibration() -> str:
+    """Current scoring weights, confidence thresholds, and severity levels.
+
+    Read this to understand how confidence scores are computed and what
+    the threshold boundaries mean. These values are used by all tools.
+    """
+    return json.dumps(CALIBRATION, indent=2)
+
+
+# ── Prompts ───────────────────────────────────────────────────────────────
+
+@mcp.prompt()
+def assess_my_response(response_text: str) -> str:
+    """Guided workflow for assessing uncertainty in a single response.
+
+    Use this when you have generated a response and want to know how
+    confident you should be before presenting it.
+    """
+    return (
+        f"I need to assess my confidence in the following response:\n\n"
+        f"---\n{response_text}\n---\n\n"
+        f"Steps:\n"
+        f"1. Call the `confidence_report` tool with the text above and any "
+        f"log-prob data you have available.\n"
+        f"2. Review the `recommendation` field:\n"
+        f"   - \"proceed\": Present the response normally.\n"
+        f"   - \"verify\": Present it but flag uncertain spans for the human.\n"
+        f"   - \"abstain\": Tell the human you are not confident enough.\n"
+        f"3. If there are `uncertain_spans`, check their `display.severity` "
+        f"to decide which parts need the most attention.\n"
+        f"4. Use the `explanation` field to communicate your uncertainty "
+        f"to the human in natural language."
+    )
+
+
+@mcp.prompt()
+def compare_drafts(draft_texts: str) -> str:
+    """Guided workflow for comparing multiple draft responses.
+
+    Use this when you have generated several candidate responses and
+    want to pick the best one or understand where they disagree.
+    Pass draft texts separated by |||.
+    """
+    drafts = [d.strip() for d in draft_texts.split("|||") if d.strip()]
+    numbered = "\n".join(f"Draft {i}: {d}" for i, d in enumerate(drafts))
+    return (
+        f"I have {len(drafts)} draft responses to compare:\n\n"
+        f"{numbered}\n\n"
+        f"Steps:\n"
+        f"1. Call `compare_responses` with each draft as a separate entry.\n"
+        f"   Include any log-prob or embedding data you have.\n"
+        f"2. Check `self_consistency` in the result — if `agreement` is low\n"
+        f"   but confidence is high, the drafts contradict each other.\n"
+        f"   This is a strong signal to verify with the human.\n"
+        f"3. Check `best_index` to see which draft scored highest.\n"
+        f"4. If `score_spread` is large, explain why one draft is better.\n"
+        f"5. If all drafts agree and are confident, proceed with the best one."
+    )
 
 
 # ── Tool 1 ────────────────────────────────────────────────────────────────
@@ -43,6 +170,10 @@ def analyze_logprobs(
     Returns per-token margins/entropies, sequence-level statistics,
     boundary token count, participation ratio, and a confidence label.
     """
+    _log_tool("analyze_logprobs", n_tokens=len(tokens),
+              has_top_logprobs=top_logprobs is not None)
+    t0 = time.monotonic()
+
     result: dict = {}
 
     # Per-token breakdown
@@ -84,6 +215,7 @@ def analyze_logprobs(
     result["confidence_score"] = score
     result["confidence_label"] = label
 
+    _log.debug(f"analyze_logprobs done in {time.monotonic()-t0:.3f}s score={score}")
     return result
 
 
@@ -100,6 +232,9 @@ def analyze_embeddings(
     dimensionality, and (for N > 50) correlation dimension.
     If group labels are provided, per-group statistics are included.
     """
+    _log_tool("analyze_embeddings", n_vectors=len(embeddings),
+              has_labels=labels is not None)
+
     emb = np.array(embeddings, dtype=np.float64)
     result = compute_embedding_pr(emb)
 
@@ -142,6 +277,10 @@ def confidence_report(
     Returns a confidence score, label, uncertain spans, explanation,
     raw metrics, and a recommendation (proceed / verify / abstain).
     """
+    _log_tool("confidence_report", text_len=len(text),
+              has_logprobs=logprobs is not None,
+              has_top_logprobs=top_logprobs is not None)
+
     metrics: dict = {}
     margins = None
     entropies = None
@@ -206,7 +345,12 @@ def compare_responses(responses: list[dict]) -> dict:
 
     Each entry should have at least ``text``; optionally ``logprobs``,
     ``top_logprobs``, and/or ``embedding`` (a single vector).
+
+    Includes self-consistency analysis: if responses are confident but
+    disagree with each other, that is a strong uncertainty signal.
     """
+    _log_tool("compare_responses", n_responses=len(responses))
+
     per_response: list[dict] = []
 
     for i, resp in enumerate(responses):
@@ -225,6 +369,10 @@ def compare_responses(responses: list[dict]) -> dict:
         entry["confidence_label"] = classify_confidence(score)
         per_response.append(entry)
 
+    # Self-consistency (text agreement)
+    texts = [r.get("text", "") for r in responses if r.get("text")]
+    consistency = compute_self_consistency(texts)
+
     # Embedding-level comparison
     emb_analysis = None
     emb_list = [r["embedding"] for r in responses if "embedding" in r]
@@ -236,20 +384,32 @@ def compare_responses(responses: list[dict]) -> dict:
     best_idx = int(np.argmax(scores))
     spread = round(float(max(scores) - min(scores)), 4) if scores else 0.0
 
+    # Build recommendation considering both confidence and agreement
+    agreement = consistency.get("agreement", 1.0)
+    if agreement < 0.3 and max(scores) > 0.6:
+        rec = (
+            f"Warning: responses are confident but disagree with each other "
+            f"(agreement={agreement:.2f}). Verify before proceeding."
+        )
+    elif spread < 0.15:
+        rec = (
+            f"Response {best_idx} has the highest confidence "
+            f"({scores[best_idx]:.2f}). Responses largely agree."
+        )
+    else:
+        rec = (
+            f"Response {best_idx} has the highest confidence "
+            f"({scores[best_idx]:.2f}). "
+            f"Significant confidence spread — consider verifying."
+        )
+
     return {
         "per_response": per_response,
         "best_index": best_idx,
         "score_spread": spread,
+        "self_consistency": consistency,
         "embedding_analysis": emb_analysis,
-        "recommendation": (
-            f"Response {best_idx} has the highest confidence "
-            f"({scores[best_idx]:.2f}). "
-            + (
-                "Responses largely agree in confidence."
-                if spread < 0.15
-                else "Significant confidence spread — consider verifying."
-            )
-        ),
+        "recommendation": rec,
     }
 
 
@@ -267,8 +427,10 @@ def post_with_confidence(
     """Post to Moltbook with embedded confidence metadata.
 
     Appends an agent-metadata block to the content and posts via the
-    Moltbook SDK. Fails gracefully if no MOLTBOOK_API_KEY is configured.
+    Moltbook API. Fails gracefully if no MOLTBOOK_API_KEY is configured.
     """
+    _log_tool("post_with_confidence", submolt=submolt,
+              confidence=confidence_label)
     return post_to_moltbook(
         submolt=submolt,
         title=title,
@@ -295,6 +457,8 @@ def comment_with_confidence(
     confidence_label are provided, an agent-metadata block is appended.
     Fails gracefully if no MOLTBOOK_API_KEY is configured.
     """
+    _log_tool("comment_with_confidence", post_id=post_id,
+              confidence=confidence_label)
     return comment_on_moltbook(
         post_id=post_id,
         content=content,
@@ -307,7 +471,6 @@ def comment_with_confidence(
 # ── Entry point ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import sys
-
     transport = sys.argv[1] if len(sys.argv) > 1 else "stdio"
+    _log.info(f"starting kosmos MCP server transport={transport}")
     mcp.run(transport=transport)

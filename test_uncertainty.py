@@ -10,6 +10,7 @@ from .uncertainty import (
     compute_boundary_ratio,
     compute_confidence_score,
     compute_embedding_pr,
+    compute_self_consistency,
     compute_sequence_pr,
     compute_token_entropies,
     compute_token_margins,
@@ -136,7 +137,37 @@ def test_uncertain_spans():
     assert spans[1]["char_start"] == 18  # len("The cat sat on the") = 18
     assert spans[1]["char_end"] == 22    # len("The cat sat on the mat") = 22
     assert full_text[spans[1]["char_start"]:spans[1]["char_end"]] == " mat"
+    # Display hints
+    assert "display" in spans[0]
+    assert spans[0]["display"]["severity"] in ("critical", "high", "moderate")
+    assert spans[0]["display"]["color"].startswith("#")
     print("  uncertain_spans: PASS")
+
+
+def test_self_consistency():
+    # Very similar texts → high agreement
+    texts_agree = [
+        "The capital of France is Paris",
+        "The capital of France is Paris, a major European city",
+    ]
+    res = compute_self_consistency(texts_agree)
+    assert res["agreement"] > 0.3, f"Expected high agreement, got {res['agreement']}"
+
+    # Contradictory texts → low agreement
+    texts_disagree = [
+        "The answer is definitely yes, we should proceed",
+        "The answer is no, this approach will fail completely",
+    ]
+    res_dis = compute_self_consistency(texts_disagree)
+    assert res_dis["agreement"] < res["agreement"], (
+        f"Disagreeing texts ({res_dis['agreement']}) should have lower "
+        f"agreement than agreeing ({res['agreement']})"
+    )
+
+    # Single text → agreement = 1
+    res_single = compute_self_consistency(["just one response"])
+    assert res_single["agreement"] == 1.0
+    print("  self_consistency: PASS")
 
 
 def test_generate_explanation():
@@ -189,6 +220,7 @@ if __name__ == "__main__":
     test_confidence_score()
     test_embedding_pr()
     test_uncertain_spans()
+    test_self_consistency()
     test_generate_explanation()
     test_confidence_report_integration()
     print("\nAll tests passed.")

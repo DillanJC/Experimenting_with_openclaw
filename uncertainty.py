@@ -312,6 +312,7 @@ def find_uncertain_spans(
         else:
             if in_span:
                 text = "".join(span_tokens)
+                margin_rounded = round(span_min, 4)
                 spans.append({
                     "start": start,
                     "end": i,
@@ -319,12 +320,14 @@ def find_uncertain_spans(
                     "char_end": char_offsets[start] + len(text),
                     "tokens": span_tokens,
                     "text": text,
-                    "min_margin": round(span_min, 4),
+                    "min_margin": margin_rounded,
+                    "display": _span_severity(span_min),
                 })
                 in_span = False
     # Close trailing span
     if in_span:
         text = "".join(span_tokens)
+        margin_rounded = round(span_min, 4)
         spans.append({
             "start": start,
             "end": len(tokens),
@@ -332,9 +335,57 @@ def find_uncertain_spans(
             "char_end": char_offsets[start] + len(text),
             "tokens": span_tokens,
             "text": text,
-            "min_margin": round(span_min, 4),
+            "min_margin": margin_rounded,
+            "display": _span_severity(span_min),
         })
     return spans
+
+
+def _span_severity(min_margin: float) -> dict:
+    """Map a span's minimum margin to a display hint for frontends."""
+    if min_margin < 0.1:
+        return {"severity": "critical", "color": "#e53e3e"}
+    if min_margin < 0.25:
+        return {"severity": "high", "color": "#dd6b20"}
+    return {"severity": "moderate", "color": "#d69e2e"}
+
+
+def compute_self_consistency(texts: list[str], n: int = 2) -> dict:
+    """Measure agreement between multiple response texts using n-gram overlap.
+
+    Returns pairwise Jaccard similarities and an aggregate agreement score.
+    A high agreement score with high confidence = trustworthy.
+    High confidence but low agreement = contradictory answers, be wary.
+    """
+    if len(texts) < 2:
+        return {"agreement": 1.0, "pairwise": [], "n": n}
+
+    def _ngrams(text: str, n: int) -> set[tuple[str, ...]]:
+        words = text.lower().split()
+        if len(words) < n:
+            return {tuple(words)}
+        return {tuple(words[i:i + n]) for i in range(len(words) - n + 1)}
+
+    sets = [_ngrams(t, n) for t in texts]
+    pairwise: list[dict] = []
+    scores: list[float] = []
+
+    for i in range(len(sets)):
+        for j in range(i + 1, len(sets)):
+            union = len(sets[i] | sets[j])
+            if union == 0:
+                sim = 1.0
+            else:
+                sim = len(sets[i] & sets[j]) / union
+            sim = round(sim, 4)
+            pairwise.append({"i": i, "j": j, "similarity": sim})
+            scores.append(sim)
+
+    return {
+        "agreement": round(float(np.mean(scores)), 4),
+        "pairwise": pairwise,
+        "n": n,
+    }
 
 
 def generate_explanation(metrics: dict) -> str:
